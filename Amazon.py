@@ -851,4 +851,4 @@ def example_usage_3():
 # example_usage_3()
 
 
-#data = amazon_detailed_scraper("Gaming Keybord", max_products=50)
+#data = amazon_detailed_scraper("Gaming Mouse", max_products=50)
