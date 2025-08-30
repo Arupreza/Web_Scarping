@@ -1,10 +1,12 @@
 # Selenium_Amazon.py
-# Run Chromedriver first:
+# Run Chromedriver first (example):
 #   chromedriver --port=9515 --allowed-origins="*" --allowed-ips=""
-# Then run:
-#   python Selenium_Amazon.py --query "wireless headphones" --max_products 3
 #
-# Results are saved to: scrapes/<query>/<YYYYmmdd_HHMMSS>/results.csv by default.
+# Then run:
+#   python Selenium_Amazon.py --query "portable monitor with bluetooth" --max_products=10 \
+#     --max_review_pages=5 --max_reviews=300 --max_foreign_pages=3 --max_foreign_reviews=200
+#
+# Results saved to: ./Products/<sanitized_query>_<YYYYmmdd_HHMMSS>.csv
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -12,57 +14,126 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
+
 import time
-import pandas as pd
 import re
-import pyperclip
 import argparse
 from pathlib import Path
 from datetime import datetime
 import sys
+import pyperclip
+import pandas as pd
 
-# -------------------- small utils --------------------
+# -------------------- utilities --------------------
 def sanitize_name(s: str) -> str:
-    s = s.strip().lower()
+    s = (s or "").strip().lower()
     s = re.sub(r"[^a-z0-9._ -]+", "", s)
     s = re.sub(r"\s+", "_", s)
     return s[:80] if s else "query"
 
 def timestamp() -> str:
-    from datetime import datetime
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 def ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
 
-# -------------------- selenium helpers --------------------
-def find_element_with_fallback(driver, xpaths):
-    for i, xpath in enumerate(xpaths):
-        try:
-            element = driver.find_element(By.XPATH, xpath)
-            print(f"Found element with XPath {i+1}: {xpath}")
-            return element
-        except:
-            continue
-    raise Exception("None of the XPaths worked")
+def get_asin_from_url(url: str) -> str | None:
+    if not url: return None
+    for pat in [r"/dp/([A-Z0-9]{8,16})", r"/product-reviews/([A-Z0-9]{8,16})", r"/global-reviews/([A-Z0-9]{8,16})"]:
+        m = re.search(pat, url)
+        if m: return m.group(1)
+    return None
 
 def wait_for_page_load(driver, timeout=10):
     try:
-        WebDriverWait(driver, timeout).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
-        )
+        WebDriverWait(driver, timeout).until(lambda d: d.execute_script("return document.readyState") == "complete")
         time.sleep(2)
     except:
         time.sleep(5)
 
 def scroll_to_element(driver, element):
     try:
-        driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", element)
+        driver.execute_script("arguments[0].scrollIntoView({behavior:'smooth',block:'center'});", element)
         time.sleep(1)
     except:
         pass
 
+def try_click(driver, by, selector, timeout=6):
+    try:
+        el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((by, selector)))
+        scroll_to_element(driver, el)
+        try: el.click()
+        except: driver.execute_script("arguments[0].click();", el)
+        return True
+    except:
+        return False
+
+def top_k_review_texts(reviews, k=5):
+    """Return exactly k review texts (strings), trimming and padding with ''. Handles dict or str."""
+    out = []
+    for rv in (reviews or []):
+        if isinstance(rv, dict):
+            t = (rv.get("review_text") or "").strip()
+        else:
+            t = (rv or "").strip()
+        if t:
+            out.append(t)
+        if len(out) >= k:
+            break
+    while len(out) < k:
+        out.append("")
+    return out[:k]
+
+# -------------------- warranty & support --------------------
+def scrape_warranty_support(driver) -> dict:
+    heading_text, body_text = "", ""
+
+    x_heading = '//*[@id="productSpecifications_dp_warranty_and_support"]/div/h1'
+    x_span3  = '//*[@id="productSpecifications_dp_warranty_and_support"]/div/div[1]/span[3]'
+
+    fallback_headings = [
+        x_heading,
+        '//div[@id="productSpecifications_dp_warranty_and_support"]//h1',
+        '//*[@id="productSupportAndWarranty"]//h1',
+        '//h1[contains(., "Warranty") or contains(., "Support")]',
+        '//h2[contains(., "Warranty") or contains(., "Support")]'
+    ]
+    fallback_bodies = [
+        x_span3,
+        '//*[@id="productSpecifications_dp_warranty_and_support"]//div[contains(@class,"a-section")]',
+        '//*[@id="productSupportAndWarranty"]//div[contains(@class,"a-section")]',
+        '//*[contains(text(), "Warranty")]/ancestor::div[1]',
+    ]
+
+    for expander in [
+        '//*[@id="productSpecifications_dp_warranty_and_support"]//a[contains(@class,"a-expander-header")]',
+        '//*[@id="productSupportAndWarranty"]//a[contains(@class,"a-expander-header")]',
+    ]:
+        if try_click(driver, By.XPATH, expander, timeout=2):
+            time.sleep(1)
+
+    for xp in fallback_headings:
+        try:
+            el = driver.find_element(By.XPATH, xp)
+            heading_text = (el.text or el.get_attribute("textContent") or "").strip()
+            if heading_text: break
+        except:
+            continue
+
+    for xp in fallback_bodies:
+        try:
+            el = driver.find_element(By.XPATH, xp)
+            body_text = (el.text or el.get_attribute("textContent") or "").strip()
+            if body_text and len(body_text) > 5: break
+        except:
+            continue
+
+    heading_text = re.sub(r"\s+", " ", heading_text or "").strip()
+    body_text = re.sub(r"\s+", " ", body_text or "").strip()
+    return {"warranty_heading": heading_text or "Not found", "warranty_text": body_text or "Not found"}
+
+# -------------------- product link helper (Share → Copy link; else fallback) --------------------
 def get_product_link(driver, product_number):
     try:
         print(f"    → Getting product link for product {product_number}...")
@@ -75,223 +146,498 @@ def get_product_link(driver, product_number):
             '//*[@id="ssf-primary-widget-desktop"]//a',
             '//div[@id="ssf-primary-widget-desktop"]//a',
             '//*[contains(@id, "ssf-primary-widget")]//a',
-            '//a[contains(@class, "a-popover-trigger")]//span[contains(text(), "Share")]',
-            '//span[contains(text(), "Share")]//parent::a',
+            '//span[contains(text(), "Share")]/parent::a',
             '//*[@id="share"]',
             '//button[contains(@aria-label, "Share")]',
             '//a[contains(@href, "share")]'
         ]
-        share_clicked = False
         for i, selector in enumerate(share_button_selectors):
-            try:
-                print(f"    → Trying share button selector {i+1}: {selector}")
-                share_button = WebDriverWait(driver, 8).until(
-                    EC.element_to_be_clickable((By.XPATH, selector))
-                )
-                scroll_to_element(driver, share_button)
-                try:
-                    share_button.click()
-                except:
-                    driver.execute_script("arguments[0].click();", share_button)
+            if try_click(driver, By.XPATH, selector, timeout=6):
                 print(f"    ✓ Clicked share button with selector {i+1}")
-                share_clicked = True
-                time.sleep(3)
+                time.sleep(2)
                 break
-            except Exception as e:
-                print(f"    → Share selector {i+1} failed: {str(e)[:50]}...")
-                continue
-        if not share_clicked:
-            print("    ✗ Could not find any share button")
-            return "Share button not found"
 
         copy_link_selectors = [
-            '//*[@id="ssf-channel-copy link"]/span[2]',
-            '//*[@id="ssf-channel-copy link"]//span[2]',
-            '//*[@id="ssf-channel-copy link"]',
-            '//span[@id="ssf-channel-copy link"]//span[2]',
-            '//div[@id="ssf-channel-copy link"]//span[2]',
-            '//*[contains(@id, "copy link")]//span[2]',
-            '//*[contains(@id, "copy link")]//span[contains(text(), "Copy link")]',
-            '//*[contains(@id, "copy")]//span[text()="Copy link"]',
             '//span[contains(text(), "Copy link")]',
             '//button[contains(text(), "Copy link")]',
-            '//a[contains(text(), "Copy link")]',
-            '//*[contains(@id, "copy")]//span[2]'
+            '//a[contains(text(), "Copy link")]'
         ]
-        copy_clicked = False
         for i, selector in enumerate(copy_link_selectors):
-            try:
-                print(f"    → Trying copy link selector {i+1}: {selector}")
-                copy_link_button = WebDriverWait(driver, 8).until(
-                    EC.element_to_be_clickable((By.XPATH, selector))
-                )
-                scroll_to_element(driver, copy_link_button)
-                try:
-                    copy_link_button.click()
-                except:
-                    driver.execute_script("arguments[0].click();", copy_link_button)
+            if try_click(driver, By.XPATH, selector, timeout=5):
                 print(f"    ✓ Clicked copy link button with selector {i+1}")
-                copy_clicked = True
-                time.sleep(3)
+                time.sleep(2)
                 break
-            except Exception as e:
-                print(f"    → Copy selector {i+1} failed: {str(e)[:50]}...")
-                continue
-        if not copy_clicked:
-            print("    ✗ Could not find copy link button")
-            try:
-                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-            except:
-                pass
-            return "Copy link button not found"
 
-        for attempt in range(8):
-            try:
-                time.sleep(1.5)
-                copied_link = pyperclip.paste()
-                print(f"    → Attempt {attempt + 1}: Clipboard content: '{copied_link[:100]}...'")
-                if copied_link and copied_link.strip():
-                    copied_link = copied_link.strip()
-                    amazon_patterns = [r'https://a\.co/', r'amazon\.com', r'amzn\.to']
-                    if any(re.search(p, copied_link, re.IGNORECASE) for p in amazon_patterns):
-                        print(f"    ✓ Successfully copied valid Amazon product link: {copied_link}")
-                        try:
-                            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-                            time.sleep(1)
-                        except:
-                            pass
-                        return copied_link
-                    else:
-                        print(f"    → Attempt {attempt + 1}: Not a valid Amazon link, retrying...")
-                else:
-                    print(f"    → Attempt {attempt + 1}: Clipboard empty or invalid, retrying...")
-            except Exception as e:
-                print(f"    → Attempt {attempt + 1}: Error accessing clipboard: {e}")
+        for _ in range(6):
+            time.sleep(1.2)
+            try: copied_link = pyperclip.paste().strip()
+            except: copied_link = ""
+            if copied_link and re.search(r"(amazon\.|a\.co|amzn\.to)", copied_link, re.I):
+                return copied_link
 
-            if attempt < 7:
-                try:
-                    for selector in copy_link_selectors[:3]:
-                        try:
-                            driver.find_element(By.XPATH, selector).click()
-                            print(f"    → Re-clicked copy button for attempt {attempt + 2}")
-                            break
-                        except:
-                            continue
-                except:
-                    pass
-
-        print("    ⚠ All clipboard attempts failed, trying alternative methods...")
-        try:
-            link_elements = driver.find_elements(By.XPATH, '//input[contains(@value, "amazon.com") or contains(@value, "a.co")]')
-            for elem in link_elements:
-                link_value = elem.get_attribute('value')
-                if link_value and ('amazon.com' in link_value or 'a.co' in link_value):
-                    print(f"    ✓ Found link in input field: {link_value}")
-                    return link_value
-        except:
-            pass
-        try:
-            current_url = driver.current_url
-            if 'amazon.com' in current_url and '/dp/' in current_url:
-                print(f"    ⚠ Using current URL as fallback: {current_url}")
-                return current_url
-        except:
-            pass
-        return "Link extraction failed - clipboard and alternatives unsuccessful"
-
+        cur = driver.current_url
+        if 'amazon.' in cur and '/dp/' in cur:
+            return cur
+        return "Link extraction failed"
     except Exception as e:
         print(f"    ✗ General error getting product link: {e}")
+        return driver.current_url
+
+# -------------------- reviews: open reviews page --------------------
+def open_reviews_page_from_product(driver, product_url: str) -> str | None:
+    """
+    Ensure we end up on the canonical /product-reviews/<ASIN> page.
+    If clicking '#acrCustomerReviewText' doesn't redirect there, build the URL.
+    """
+    try:
+        driver.get(product_url)
+        wait_for_page_load(driver, 10)
+
+        for by, sel in [(By.ID, "acrCustomerReviewText"),
+                        (By.XPATH, '//*[@id="acrCustomerReviewText"]'),
+                        (By.CSS_SELECTOR, '#acrCustomerReviewText')]:
+            if try_click(driver, by, sel, timeout=4):
+                break
+
+        time.sleep(1.5)
+        cur = driver.current_url
+        if "/product-reviews/" in cur:
+            return cur
+
+        asin = get_asin_from_url(product_url) or get_asin_from_url(cur)
+        if asin:
+            return f"https://www.amazon.com/product-reviews/{asin}/?reviewerType=all_reviews"
+    except Exception as e:
+        print(f"    ✗ Could not open reviews page: {e}")
+    return None
+
+# -------------------- reviews: domestic (/product-reviews) --------------------
+def scrape_full_reviews_from_reviews_page(driver, reviews_page_url: str, max_pages=5, max_reviews=300) -> list[dict]:
+    results = []
+    if not reviews_page_url:
+        return results
+
+    print(f"  → Navigating to reviews page: {reviews_page_url}")
+    driver.get(reviews_page_url)
+    wait_for_page_load(driver, 10)
+
+    for page in range(1, max_pages + 1):
+        print(f"    • On reviews page {page}")
+        time.sleep(1.2)
+
+        blocks = []
+        for selector in [
+            '//div[@data-hook="review"]',
+            '//div[contains(@class,"a-section review aok-relative")]'
+        ]:
+            try:
+                blocks = driver.find_elements(By.XPATH, selector)
+                if blocks: break
+            except:
+                continue
+
+        print(f"      Found {len(blocks)} review blocks")
+        for b in blocks:
+            try:
+                title = ""
+                text = ""
+                rating = ""
+                date = ""
+
+                for xp in ['.//a[@data-hook="review-title"]//span', './/span[@data-hook="review-title"]']:
+                    try:
+                        title = b.find_element(By.XPATH, xp).text.strip()
+                        if title: break
+                    except: continue
+
+                for xp in ['.//span[@data-hook="review-body"]//span', './/span[@data-hook="review-body"]']:
+                    try:
+                        text = b.find_element(By.XPATH, xp).text.strip()
+                        if text: break
+                    except: continue
+
+                for xp in ['.//i[@data-hook="review-star-rating"]//span', './/i[contains(@class,"a-icon-star")]//span']:
+                    try:
+                        rating = b.find_element(By.XPATH, xp).text.strip()
+                        if rating: break
+                    except: continue
+
+                for xp in ['.//span[@data-hook="review-date"]', './/span[contains(@class,"review-date")]']:
+                    try:
+                        date = b.find_element(By.XPATH, xp).text.strip()
+                        if date: break
+                    except: continue
+
+                if text:
+                    results.append({
+                        "review_title": title,
+                        "review_text": text,
+                        "review_rating": rating,
+                        "review_date": date,
+                        "origin_country": ""  # domestic
+                    })
+                    if len(results) >= max_reviews:
+                        print("      Reached max_reviews limit")
+                        return results
+            except:
+                continue
+
+        # Next page
+        next_clicked = False
+        for xp in ['//ul[@class="a-pagination"]//li[@class="a-last"]/a',
+                   '//li[contains(@class,"a-last")]/a']:
+            if try_click(driver, By.XPATH, xp, timeout=4):
+                next_clicked = True
+                wait_for_page_load(driver, 10)
+                break
+        if not next_clicked:
+            break
+
+    return results
+
+# -------------------- reviews: inline domestic on PRODUCT page (your XPaths) --------------------
+def scrape_inline_domestic_blocks(driver, limit=200) -> list[dict]:
+    results = []
+    try:
         try:
-            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            hdr = driver.find_element(By.XPATH, '//*[@id="cm-cr-local-reviews-title"]/h3')
+            scroll_to_element(driver, hdr)
+            time.sleep(0.7)
         except:
             pass
-        return f"Error getting link: {str(e)}"
 
-def scrape_product_details(driver, product_url, product_number):
+        blocks = driver.find_elements(By.XPATH, '//div[starts-with(@id,"customer_review-") and not(starts-with(@id,"customer_review_foreign-"))]')
+        print(f"      Inline domestic blocks found: {len(blocks)}")
+
+        for b in blocks[:limit]:
+            try:
+                title = ""
+                for xp in ['./div[2]/h5/a/span[2]',
+                           './div[1]/a/div[2]/span',
+                           './/a[@data-hook="review-title"]//span',
+                           './/span[@data-hook="review-title"]']:
+                    try:
+                        title = b.find_element(By.XPATH, xp).text.strip()
+                        if title: break
+                    except: continue
+
+                text = ""
+                for xp in ['./div[4]/span/div/div[1]/span',
+                           './/span[@data-hook="review-body"]//span',
+                           './/span[@data-hook="review-body"]']:
+                    try:
+                        text = b.find_element(By.XPATH, xp).text.strip()
+                        if text: break
+                    except: continue
+
+                rating = ""
+                for xp in ['.//i[@data-hook="review-star-rating"]//span',
+                           './/span[contains(@class,"a-icon-alt")]']:
+                    try:
+                        rating = b.find_element(By.XPATH, xp).text.strip()
+                        if rating: break
+                    except: continue
+
+                date = ""
+                for xp in ['.//span[@data-hook="review-date"]',
+                           './/span[contains(@class,"review-date")]']:
+                    try:
+                        date = b.find_element(By.XPATH, xp).text.strip()
+                        if date: break
+                    except: continue
+
+                if text:
+                    results.append({
+                        "review_title": title,
+                        "review_text": text,
+                        "review_rating": rating,
+                        "review_date": date,
+                        "origin_country": ""  # domestic
+                    })
+            except:
+                continue
+    except Exception as e:
+        print(f"      ✗ Inline domestic scrape error: {e}")
+    return results
+
+# -------------------- reviews: foreign --------------------
+def parse_country_from_date(date_text: str) -> str:
+    if not date_text: return ""
+    m = re.search(r"Reviewed in\s+(the\s+)?(.+?)\s+on\s+", date_text, re.I)
+    return m.group(2).strip() if m else ""
+
+def go_to_global_reviews_if_possible(driver) -> bool:
+    # Scroll to header if present
+    try:
+        header = driver.find_element(By.XPATH, '//*[@id="reviews-medley-global-expand-head"]/h3')
+        scroll_to_element(driver, header); time.sleep(0.8)
+    except:
+        pass
+
+    # Try link near header
+    link_candidates = [
+        '//h3[@id="reviews-medley-global-expand-head"]/following::a[contains(@href,"global-reviews")][1]',
+        '//a[contains(@href,"/global-reviews/")]',
+        '//a[contains(., "other countries")]',
+        '//a[contains(., "다른 국가") or contains(., "다른 나라")]',
+    ]
+    for xp in link_candidates:
+        try:
+            el = driver.find_element(By.XPATH, xp)
+            href = el.get_attribute("href") or ""
+            if href:
+                driver.get(href)
+                wait_for_page_load(driver, 10)
+                return True
+        except:
+            continue
+    return False
+
+def scrape_inline_foreign_blocks(driver, limit=200) -> list[dict]:
+    results = []
+    blocks = driver.find_elements(By.XPATH, '//div[starts-with(@id,"customer_review_foreign-")]')
+    print(f"      Inline foreign blocks found: {len(blocks)}")
+    for b in blocks[:limit]:
+        try:
+            title = ""
+            for xp in ['.//a[@data-hook="review-title"]//span', './/span[@data-hook="review-title"]']:
+                try:
+                    title = b.find_element(By.XPATH, xp).text.strip()
+                    if title: break
+                except: continue
+
+            text = ""
+            for xp in ['.//span[@data-hook="review-body"]//span',
+                       './/div[4]//span']:
+                try:
+                    text = b.find_element(By.XPATH, xp).text.strip()
+                    if text: break
+                except: continue
+
+            rating = ""
+            for xp in ['.//i[@data-hook="review-star-rating"]//span',
+                       './/span[contains(@class,"a-icon-alt")]']:
+                try:
+                    rating = b.find_element(By.XPATH, xp).text.strip()
+                    if rating: break
+                except: continue
+
+            date = ""
+            for xp in ['.//span[@data-hook="review-date"]',
+                       './/span[contains(@class,"review-date")]']:
+                try:
+                    date = b.find_element(By.XPATH, xp).text.strip()
+                    if date: break
+                except: continue
+
+            if text:
+                results.append({
+                    "review_title": title,
+                    "review_text": text,
+                    "review_rating": rating,
+                    "review_date": date,
+                    "origin_country": parse_country_from_date(date)
+                })
+        except:
+            continue
+    return results
+
+def scrape_foreign_reviews_from_reviews_page(driver, max_pages=3, max_reviews=200) -> list[dict]:
+    collected: list[dict] = []
+    cur = driver.current_url
+    at_global = "/global-reviews/" in cur or go_to_global_reviews_if_possible(driver)
+
+    if at_global:
+        print("    ✓ On global-reviews listing; scraping foreign reviews (paged)")
+        for page in range(1, max_pages + 1):
+            time.sleep(1)
+            blocks = []
+            for selector in ['//div[@data-hook="review"]',
+                             '//div[contains(@class,"a-section review aok-relative")]']:
+                try:
+                    blocks = driver.find_elements(By.XPATH, selector)
+                    if blocks: break
+                except: continue
+
+            print(f"      Global page {page}: {len(blocks)} reviews")
+            for b in blocks:
+                try:
+                    title = ""
+                    for xp in ['.//a[@data-hook="review-title"]//span', './/span[@data-hook="review-title"]']:
+                        try:
+                            title = b.find_element(By.XPATH, xp).text.strip()
+                            if title: break
+                        except: continue
+
+                    text = ""
+                    for xp in ['.//span[@data-hook="review-body"]//span', './/span[@data-hook="review-body"]']:
+                        try:
+                            text = b.find_element(By.XPATH, xp).text.strip()
+                            if text: break
+                        except: continue
+
+                    rating = ""
+                    for xp in ['.//i[@data-hook="review-star-rating"]//span', './/i[contains(@class,"a-icon-star")]//span']:
+                        try:
+                            rating = b.find_element(By.XPATH, xp).text.strip()
+                            if rating: break
+                        except: continue
+
+                    date = ""
+                    for xp in ['.//span[@data-hook="review-date"]', './/span[contains(@class,"review-date")]']:
+                        try:
+                            date = b.find_element(By.XPATH, xp).text.strip()
+                            if date: break
+                        except: continue
+
+                    if text:
+                        collected.append({
+                            "review_title": title,
+                            "review_text": text,
+                            "review_rating": rating,
+                            "review_date": date,
+                            "origin_country": parse_country_from_date(date)
+                        })
+                        if len(collected) >= max_reviews:
+                            print("      Reached max foreign reviews limit")
+                            return collected
+                except:
+                    continue
+
+            next_clicked = False
+            for xp in ['//ul[@class="a-pagination"]//li[@class="a-last"]/a',
+                       '//li[contains(@class,"a-last")]/a']:
+                if try_click(driver, By.XPATH, xp, timeout=4):
+                    next_clicked = True
+                    wait_for_page_load(driver, 10)
+                    break
+            if not next_clicked:
+                break
+
+        return collected
+
+    # Not on global list → try inline
+    print("    • Scraping inline foreign blocks on the current page")
+    return scrape_inline_foreign_blocks(driver, limit=max_reviews)
+
+# -------------------- search tile parsing --------------------
+def get_product_info_from_element(driver, product, index):
+    try:
+        scroll_to_element(driver, product); time.sleep(0.5)
+        asin = product.get_attribute('data-asin')
+
+        title = ""
+        for selector in [
+            'h2 a span','h2 span','.a-size-mini .a-color-base','.s-size-mini',
+            'h2 .a-link-normal span','[data-cy="title-recipe-title"]','.a-size-base-plus',
+            'a span.a-text-normal','.a-size-base','.a-color-base','span.a-text-normal',
+            '.s-color-base','.s-size-mini.s-spacing-none.s-color-base','h2.a-size-mini span',
+            '.a-link-normal .a-text-normal','.//h2//span[string-length(text()) > 10]',
+            './/a[contains(@href, "/dp/")]//span[string-length(text()) > 10]'
+        ]:
+            try:
+                el = product.find_element(By.XPATH, selector) if selector.startswith('.//') else product.find_element(By.CSS_SELECTOR, selector)
+                t = el.text.strip()
+                if t and len(t) > 10 and not t.lower().startswith('sponsored'):
+                    title = t; break
+            except: continue
+
+        url = ""
+        for selector in [
+            'h2 a','.a-link-normal[href*="/dp/"]','a[href*="/dp/"]','.s-link-style a',
+            'a.a-text-normal','a[href*="/gp/"]','.a-link-normal',
+            f'a[href*="{asin}"]' if asin else None,'.//a[contains(@href, "/dp/")]','.//h2//a'
+        ]:
+            if not selector: continue
+            try:
+                el = product.find_element(By.XPATH, selector) if selector.startswith('.//') else product.find_element(By.CSS_SELECTOR, selector)
+                href = el.get_attribute('href')
+                if href and ('/dp/' in href or '/gp/' in href):
+                    url = href if href.startswith('http') else "https://www.amazon.com" + href
+                    break
+            except: continue
+
+        price = ""
+        for selector in [
+            '.a-price .a-offscreen','.a-price-whole',
+            './/span[contains(@class, "a-price")]//span[@class="a-offscreen"]',
+            './/span[contains(text(), "$")]'
+        ]:
+            try:
+                el = product.find_element(By.XPATH, selector) if selector.startswith('.//') else product.find_element(By.CSS_SELECTOR, selector)
+                t = (el.text or el.get_attribute('textContent') or "").strip()
+                if t and '$' in t:
+                    price = t; break
+            except: continue
+
+        return {'title': title, 'url': url, 'price': price or "Price not available", 'asin': asin or "Not found"}
+    except Exception as e:
+        print(f"  ✗ Error extracting info for product {index}: {str(e)}")
+        return None
+
+# -------------------- product details orchestrator --------------------
+def scrape_product_details(driver, product_url, product_number,
+                           max_review_pages=5, max_reviews=300,
+                           max_foreign_pages=3, max_foreign_reviews=200):
     try:
         print(f"  → Visiting product {product_number} page...")
         driver.get(product_url)
         wait_for_page_load(driver, 10)
         product_link = get_product_link(driver, product_number)
 
-        overall_rating = ""
-        rating_selectors = [
-            '//*[@id="acrPopover"]/span[1]/a/span',
-            '.a-icon-alt',
-            '[data-hook="rating-out-of-text"]',
-            '.a-size-base.a-color-base',
-            '//span[contains(text(), "out of")]',
-            '//span[contains(text(), "stars")]',
-            '//*[contains(@class, "a-icon-alt")]'
-        ]
-        for selector in rating_selectors:
+        # Overall rating / number of ratings
+        overall_rating, num_ratings = "", ""
+        for selector in ['//*[@id="acrPopover"]/span[1]/a/span','//*[contains(@class,"a-icon-alt")]','//*[@data-hook="rating-out-of-text"]']:
             try:
-                el = driver.find_element(By.XPATH, selector) if selector.startswith('/') else driver.find_element(By.CSS_SELECTOR, selector)
-                text = el.text.strip() or el.get_attribute('textContent').strip()
+                el = driver.find_element(By.XPATH, selector)
+                text = (el.text or el.get_attribute('textContent') or "").strip()
                 if text and ('out of' in text.lower() or 'star' in text.lower()):
-                    overall_rating = text
-                    break
-            except:
-                continue
+                    overall_rating = text; break
+            except: continue
 
-        num_ratings = ""
-        num_rating_selectors = [
-            '//*[@id="acrCustomerReviewText"]',
-            '[data-hook="total-review-count"]',
-            '.a-size-base.a-color-secondary',
-            '#acrCustomerReviewText',
-            '//span[contains(text(), "rating")]',
-            '//span[contains(text(), "review")]',
-            '//*[contains(text(), "ratings")]'
-        ]
-        for selector in num_rating_selectors:
+        for selector in ['//*[@id="acrCustomerReviewText"]','//*[@data-hook="total-review-count"]','//*[contains(text(),"rating") or contains(text(),"review")]']:
             try:
-                el = driver.find_element(By.XPATH, selector) if selector.startswith('/') else driver.find_element(By.CSS_SELECTOR, selector)
-                text = el.text.strip()
-                if text and ('rating' in text.lower() or 'review' in text.lower()):
-                    num_ratings = text
-                    break
-            except:
-                continue
+                el = driver.find_element(By.XPATH, selector)
+                t = (el.text or "").strip()
+                if t and ('rating' in t.lower() or 'review' in t.lower()):
+                    num_ratings = t; break
+            except: continue
 
-        reviews = []
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-        time.sleep(2)
-        review_selectors = [
-            '[data-hook="review-body"] span',
-            '.review-text',
-            '[data-hook="review-body"]',
-            '.cr-original-review-text',
-            '//div[@data-hook="review-body"]//span[not(@class)]',
-            '//span[contains(@class, "cr-original-review-text")]'
-        ]
-        review_elements = []
-        for selector in review_selectors:
-            try:
-                elems = driver.find_elements(By.XPATH, selector) if selector.startswith('/') else driver.find_elements(By.CSS_SELECTOR, selector)
-                if elems:
-                    review_elements = elems
-                    print(f"    Found {len(elems)} reviews using selector: {selector}")
-                    break
-            except:
-                continue
+        warranty = scrape_warranty_support(driver)
 
-        for element in review_elements[:15]:
-            try:
-                t = element.text.strip()
-                if t and 20 < len(t) < 1000:
-                    reviews.append(t)
-                    if len(reviews) >= 10:
-                        break
-            except:
-                continue
+        # Reviews: domestic
+        reviews_page_url = open_reviews_page_from_product(driver, product_url)
+        domestic_reviews = scrape_full_reviews_from_reviews_page(
+            driver, reviews_page_url or "", max_pages=max_review_pages, max_reviews=max_reviews
+        )
 
-        print(f"    ✓ Collected: Rating={overall_rating}, Reviews={num_ratings}, Review texts={len(reviews)}, Product Link={product_link if isinstance(product_link, str) else ''}")
+        # Fallback inline domestic if needed
+        if not domestic_reviews:
+            print("    • Domestic reviews not found on reviews page; trying inline domestic blocks")
+            driver.get(product_url); wait_for_page_load(driver, 8)
+            domestic_reviews = scrape_inline_domestic_blocks(driver, limit=max_reviews)
+
+        # Reviews: foreign
+        foreign_reviews = []
+        if reviews_page_url:
+            foreign_reviews = scrape_foreign_reviews_from_reviews_page(
+                driver, max_pages=max_foreign_pages, max_reviews=max_foreign_reviews
+            )
+        if not foreign_reviews:
+            print("    • Foreign reviews not found via global page; trying inline extraction")
+            driver.get(product_url); wait_for_page_load(driver, 6)
+            foreign_reviews = scrape_inline_foreign_blocks(driver, limit=max_foreign_reviews)
+
+        print(f"    ✓ Collected: domestic={len(domestic_reviews)}, foreign={len(foreign_reviews)}")
+
         return {
-            'overall_rating': overall_rating if overall_rating else "Not found",
-            'num_ratings': num_ratings if num_ratings else "Not found",
-            'reviews': reviews[:10] if reviews else ["No reviews found"],
-            'product_link': product_link
+            'overall_rating': overall_rating or "Not found",
+            'num_ratings': num_ratings or "Not found",
+            'reviews_full': domestic_reviews,
+            'reviews_foreign': foreign_reviews,
+            'product_link': product_link,
+            'warranty_heading': warranty["warranty_heading"],
+            'warranty_text': warranty["warranty_text"]
         }
 
     except Exception as e:
@@ -299,171 +645,119 @@ def scrape_product_details(driver, product_url, product_number):
         return {
             'overall_rating': "Error loading",
             'num_ratings': "Error loading",
-            'reviews': ["Error loading reviews"],
-            'product_link': "Error loading"
+            'reviews_full': [],
+            'reviews_foreign': [],
+            'product_link': "Error loading",
+            'warranty_heading': "Error loading",
+            'warranty_text': "Error loading"
         }
 
-def get_product_info_from_element(driver, product, index):
-    try:
-        print(f"  Extracting info for product {index}...")
-        scroll_to_element(driver, product)
-        time.sleep(1)
-        asin = product.get_attribute('data-asin')
-        print(f"  Debug: Product ASIN: {asin}")
-
-        title = ""
-        title_selectors = [
-            'h2 a span','h2 span','.a-size-mini .a-color-base','.s-size-mini',
-            'h2 .a-link-normal span','[data-cy="title-recipe-title"]','.a-size-base-plus',
-            'a span.a-text-normal','.a-size-base','.a-color-base','span.a-text-normal',
-            '.s-color-base','.s-size-mini.s-spacing-none.s-color-base','h2.a-size-mini span',
-            '.a-link-normal .a-text-normal','.//h2//span[string-length(text()) > 10]',
-            './/a[contains(@href, "/dp/")]//span[string-length(text()) > 10]'
-        ]
-        for selector in title_selectors:
-            try:
-                el = product.find_element(By.XPATH, selector) if selector.startswith('.//') else product.find_element(By.CSS_SELECTOR, selector)
-                title = el.text.strip()
-                if title and len(title) > 10 and not title.lower().startswith('sponsored'):
-                    print(f"  ✓ Found title: {title[:50]}...")
-                    break
-            except:
-                continue
-        if not title:
-            try:
-                all_text = product.find_elements(By.XPATH, './/span[string-length(text()) > 15]')
-                for el in all_text:
-                    t = el.text.strip()
-                    if t and 15 < len(t) < 200 and not any(w in t.lower() for w in ['sponsored','price','$','rating','stars']):
-                        title = t
-                        print(f"  ✓ Fallback title: {title[:50]}...")
-                        break
-            except:
-                pass
-
-        url = ""
-        url_selectors = [
-            'h2 a','.a-link-normal[href*="/dp/"]','a[href*="/dp/"]','.s-link-style a',
-            'a.a-text-normal','a[href*="/gp/"]','.a-link-normal',
-            f'a[href*="{asin}"]' if asin else None,'.//a[contains(@href, "/dp/")]','.//h2//a'
-        ]
-        url_selectors = [s for s in url_selectors if s]
-        for selector in url_selectors:
-            try:
-                el = product.find_element(By.XPATH, selector) if selector.startswith('.//') else product.find_element(By.CSS_SELECTOR, selector)
-                url = el.get_attribute('href')
-                if url and ('/dp/' in url or '/gp/' in url):
-                    if not url.startswith('http'):
-                        url = "https://www.amazon.com" + url
-                    print(f"  ✓ Found URL: {url[:60]}...")
-                    break
-            except:
-                continue
-
-        price = ""
-        price_selectors = [
-            '.a-price-whole','.a-price .a-offscreen','.a-price-symbol + .a-price-whole',
-            '.a-price-range .a-offscreen','.a-price .a-price-whole','.a-price-fraction',
-            './/span[contains(@class, "a-price")]//span[@class="a-offscreen"]',
-            './/span[contains(text(), "$")]'
-        ]
-        for selector in price_selectors:
-            try:
-                el = product.find_element(By.XPATH, selector) if selector.startswith('.//') else product.find_element(By.CSS_SELECTOR, selector)
-                price_text = el.text.strip() or el.get_attribute('textContent').strip()
-                if price_text and '$' in price_text:
-                    price = price_text
-                    break
-            except:
-                continue
-        if not price:
-            try:
-                for el in product.find_elements(By.XPATH, './/span[contains(text(), "$") or contains(@class, "price")]'):
-                    t = el.text.strip()
-                    if t and '$' in t and len(t) < 20:
-                        price = t
-                        break
-            except:
-                price = "Price not available"
-
-        return {'title': title, 'url': url, 'price': price if price else "Price not available", 'asin': asin if asin else "Not found"}
-    except Exception as e:
-        print(f"  ✗ Error extracting info for product {index}: {str(e)}")
-        return None
-
-def scrape_products(driver, max_products=30):
+# -------------------- main: scrape products --------------------
+def scrape_products(
+    driver,
+    max_products: int = 30,
+    max_review_pages: int = 5,
+    max_reviews: int = 300,
+    max_foreign_pages: int = 3,
+    max_foreign_reviews: int = 200,
+):
     products_data = []
     print(f"Starting to scrape up to {max_products} products...")
-    search_results_url = driver.current_url
-    print(f"Search results URL: {search_results_url}")
 
+    search_results_url = driver.current_url
     wait_for_page_load(driver, 10)
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight/3);")
-    time.sleep(3)
+    time.sleep(1.2)
 
+    # Find product tiles
     product_infos = []
-    product_selectors = [
+    products = []
+    for selector in [
         '[data-component-type="s-search-result"]',
         '.s-result-item[data-component-type="s-search-result"]',
         '[data-asin]:not([data-asin=""])',
         '.s-result-item',
         '//div[@data-component-type="s-search-result"]',
-        '//div[contains(@class, "s-result-item") and @data-asin]'
-    ]
-    products = []
-    for selector in product_selectors:
+        '//div[contains(@class, "s-result-item") and @data-asin]',
+    ]:
         try:
-            products = driver.find_elements(By.XPATH, selector) if selector.startswith('//') else driver.find_elements(By.CSS_SELECTOR, selector)
+            if selector.startswith('//'):
+                products = driver.find_elements(By.XPATH, selector)
+            else:
+                products = driver.find_elements(By.CSS_SELECTOR, selector)
             if products:
                 print(f"Found {len(products)} products using selector: {selector}")
                 break
         except:
             continue
+
     if not products:
         print("No products found with any selector")
         return pd.DataFrame()
 
-    for i, product in enumerate(products[:max_products * 2], 1):
+    # Parse basic info from tiles
+    for i, product in enumerate(products[: max_products * 2], 1):
         try:
-            asin = product.get_attribute('data-asin')
+            asin = product.get_attribute("data-asin")
             if asin and asin.strip():
                 info = get_product_info_from_element(driver, product, i)
-                if info and info['title'] and info['url']:
+                if info and info.get("title") and info.get("url"):
                     product_infos.append(info)
                     if len(product_infos) >= max_products:
                         break
         except:
             continue
 
-    print(f"\nCollected basic info for {len(product_infos)} products from search page")
+    print(f"\nCollected basic info for {len(product_infos)} products")
+
+    # Visit each product
     for i, product_info in enumerate(product_infos, 1):
         try:
-            print(f"\nScraping product {i}/{len(product_infos)}...")
-            print(f"  Title: {product_info['title'][:50]}...")
-            details = scrape_product_details(driver, product_info['url'], i)
+            print(f"\nScraping product {i}/{len(product_infos)}: {product_info['title'][:60]}...")
+            details = scrape_product_details(
+                driver,
+                product_info["url"],
+                i,
+                max_review_pages=max_review_pages,
+                max_reviews=max_reviews,
+                max_foreign_pages=max_foreign_pages,
+                max_foreign_reviews=max_foreign_reviews,
+            )
 
-            review_data = {}
-            for j, review in enumerate(details['reviews'][:10], 1):
-                review_data[f'Review_{j}'] = review
-            for j in range(len(details['reviews']) + 1, 11):
-                review_data[f'Review_{j}'] = ""
+            # Exactly 5 domestic + 5 foreign review texts; never NaN
+            domestic_top5 = top_k_review_texts(details.get("reviews_full", []), k=5)
+            foreign_top5  = top_k_review_texts(details.get("reviews_foreign", []), k=5)
+
+            review_cols  = {f"Review_{k+1}": domestic_top5[k] for k in range(5)}
+            foreign_cols = {f"Foreign_Review_{k+1}": foreign_top5[k] for k in range(5)}
+
+            all_reviews_concat = " ||| ".join([t for t in top_k_review_texts(details.get("reviews_full", []), k=999) if t])
+            all_foreign_concat = " ||| ".join([t for t in top_k_review_texts(details.get("reviews_foreign", []), k=999) if t])
 
             product_data = {
-                'Product_Number': i,
-                'Title': product_info['title'],
-                'Price': product_info['price'],
-                'URL': product_info['url'],
-                'ASIN': product_info['asin'],
-                'Overall_Rating': details['overall_rating'],
-                'Number_of_Ratings': details['num_ratings'],
-                'Product_Link': details['product_link'],
-                **review_data
+                "Product_Number": i,
+                "Title": product_info["title"],
+                "Price": product_info["price"],
+                "URL": product_info["url"],
+                "ASIN": product_info["asin"],
+                "Overall_Rating": details.get("overall_rating", "Not found"),
+                "Number_of_Ratings": details.get("num_ratings", "Not found"),
+                "Product_Link": details.get("product_link", ""),
+                "Warranty_Heading": details.get("warranty_heading", "Not found"),
+                "Warranty_Text": details.get("warranty_text", "Not found"),
+                "All_Reviews_Concat": all_reviews_concat,
+                "All_Foreign_Reviews_Concat": all_foreign_concat,
+                "Foreign_Reviews_Count": len(details.get("reviews_foreign", []) or []),
+                **review_cols,
+                **foreign_cols,
             }
             products_data.append(product_data)
-            print(f"  ✓ Product {i} completed successfully")
+            print(f"  ✓ Product {i} done")
 
+            # Back to results
             driver.get(search_results_url)
             wait_for_page_load(driver, 5)
+
         except Exception as e:
             print(f"✗ Error scraping product {i}: {str(e)}")
             try:
@@ -475,9 +769,13 @@ def scrape_products(driver, max_products=30):
             continue
 
     print(f"\nSuccessfully scraped {len(products_data)} products with detailed information")
-    return pd.DataFrame(products_data)
+    df = pd.DataFrame(products_data).fillna("")  # ensure no NaN in review columns
+    return df
 
-def amazon_detailed_scraper(search_term, max_products=5, executor_url="http://127.0.0.1:9515", chrome_binary=None):
+# -------------------- orchestrator --------------------
+def amazon_detailed_scraper(search_term, max_products=5, executor_url="http://127.0.0.1:9515",
+                            chrome_binary=None, max_review_pages=5, max_reviews=300,
+                            max_foreign_pages=3, max_foreign_reviews=200):
     website = "https://www.amazon.com/"
     options = Options()
     options.add_argument("--no-sandbox")
@@ -499,61 +797,49 @@ def amazon_detailed_scraper(search_term, max_products=5, executor_url="http://12
         print("Successfully opened Amazon")
         wait_for_page_load(driver, 10)
 
-        page_lower = driver.page_source.lower()
-        if "captcha" in page_lower or "sorry" in page_lower:
-            print("⚠ Amazon bot check encountered; you may need to solve captcha or adjust IP/headers.")
+        # Dismiss common popups
+        for xp in [
+            '//button[@alt="Continue shopping"]',
+            '//button[contains(text(), "Continue")]',
+            '//input[@aria-labelledby="GLUXZipUpdateButton"]'
+        ]:
+            if try_click(driver, By.XPATH, xp, timeout=2):
+                print("Dismissed popup"); break
 
-        try:
-            for button_xpath in [
-                '//button[@alt="Continue shopping"]',
-                '//button[contains(text(), "Continue")]',
-                '//input[@aria-labelledby="GLUXZipUpdateButton"]'
-            ]:
-                try:
-                    driver.find_element(By.XPATH, button_xpath).click()
-                    print("Dismissed popup")
-                    time.sleep(2)
-                    break
-                except:
-                    continue
-        except:
-            print("No popup found")
-
-        try:
-            search_box = None
-            for xp in ['//*[@id="twotabsearchtextbox"]','//input[@name="field-keywords"]','#twotabsearchtextbox']:
-                try:
-                    search_box = driver.find_element(By.CSS_SELECTOR, xp) if xp.startswith('#') else driver.find_element(By.XPATH, xp)
-                    break
-                except:
-                    continue
-            if not search_box:
-                raise Exception("Could not find search box")
-
-            search_box.clear()
-            search_box.send_keys(search_term)
-            print(f"Entered '{search_term}' in search box")
-            time.sleep(2)
-
-            search_button = None
-            for xp in ['//*[@id="nav-search-submit-button"]','//input[@type="submit"][@value="Go"]','#nav-search-submit-button']:
-                try:
-                    search_button = driver.find_element(By.CSS_SELECTOR, xp) if xp.startswith('#') else driver.find_element(By.XPATH, xp)
-                    break
-                except:
-                    continue
-            if search_button:
-                search_button.click()
-            else:
-                search_box.send_keys(Keys.RETURN)
-
-            print("Search initiated")
-            wait_for_page_load(driver, 10)
-            return scrape_products(driver, max_products=max_products)
-
-        except Exception as e:
-            print(f"Error during search or scraping: {e}")
+        # Search
+        search_box = None
+        for xp in ['//*[@id="twotabsearchtextbox"]','//input[@name="field-keywords"]','#twotabsearchtextbox']:
+            try:
+                search_box = driver.find_element(By.CSS_SELECTOR, xp) if xp.startswith('#') else driver.find_element(By.XPATH, xp)
+                break
+            except: continue
+        if not search_box:
+            print("Could not find search box")
             return pd.DataFrame()
+
+        search_box.clear()
+        search_box.send_keys(search_term)
+        print(f"Entered '{search_term}' in search box")
+        time.sleep(1)
+
+        search_button = None
+        for xp in ['//*[@id="nav-search-submit-button"]','//input[@type="submit"][@value="Go"]','#nav-search-submit-button']:
+            try:
+                search_button = driver.find_element(By.CSS_SELECTOR, xp) if xp.startswith('#') else driver.find_element(By.XPATH, xp)
+                break
+            except: continue
+        if search_button: search_button.click()
+        else: search_box.send_keys(Keys.RETURN)
+
+        print("Search initiated")
+        wait_for_page_load(driver, 10)
+
+        return scrape_products(driver,
+                               max_products=max_products,
+                               max_review_pages=max_review_pages,
+                               max_reviews=max_reviews,
+                               max_foreign_pages=max_foreign_pages,
+                               max_foreign_reviews=max_foreign_reviews)
 
     except Exception as e:
         print(f"Error initializing Remote Chrome or accessing Amazon: {e}")
@@ -561,31 +847,28 @@ def amazon_detailed_scraper(search_term, max_products=5, executor_url="http://12
     finally:
         print("Script finished - browser remains open for inspection")
 
-# -------------------- saving wrapper --------------------
+# -------------------- save wrapper & CLI --------------------
 def save_results(df: pd.DataFrame, query: str, out_dir: Path, out_csv: str | None) -> Path:
-    """
-    Save directly into ./Products (or the provided out_dir) with a flat file name:
-    <sanitized_query>_<YYYYmmdd_HHMMSS>.csv, unless out_csv is given explicitly.
-    """
-    # Resolve relative out_dir against current working directory
-    base_dir = (Path.cwd() / out_dir) if not out_dir.is_absolute() else out_dir
+    base_dir = (Path.cwd() / out_dir) if not Path(out_dir).is_absolute() else Path(out_dir)
     ensure_dir(base_dir)
-
     fname = out_csv if out_csv else f"{sanitize_name(query)}_{timestamp()}.csv"
     csv_path = base_dir / fname
     df.to_csv(csv_path, index=False)
     print(f"\nSaved results to: {csv_path}")
     return csv_path
 
-# -------------------- CLI --------------------
 def parse_args():
     p = argparse.ArgumentParser(description="Amazon scraper (Remote WebDriver on chromedriver --port=9515).")
-    p.add_argument("--query", type=str, required=True, help="Product name to search (e.g., 'wireless headphones')")
-    p.add_argument("--max_products", type=int, default=5, help="Max products to scrape")
-    p.add_argument("--executor_url", type=str, default="http://127.0.0.1:9515", help="Remote WebDriver executor URL")
-    p.add_argument("--chrome_binary", type=str, default=None, help="Path to Chrome binary (optional)")
-    p.add_argument("--out_dir", type=str, default="Products", help="Output directory (default: ./Products)")
-    p.add_argument("--out_csv", type=str, default=None, help="Optional CSV filename (e.g., 'results.csv')")
+    p.add_argument("--query", type=str, required=True)
+    p.add_argument("--max_products", type=int, default=5)
+    p.add_argument("--executor_url", type=str, default="http://127.0.0.1:9515")
+    p.add_argument("--chrome_binary", type=str, default=None)
+    p.add_argument("--out_dir", type=str, default="Products")
+    p.add_argument("--out_csv", type=str, default=None)
+    p.add_argument("--max_review_pages", type=int, default=5, help="Max domestic review pages")
+    p.add_argument("--max_reviews", type=int, default=300, help="Max domestic reviews")
+    p.add_argument("--max_foreign_pages", type=int, default=3, help="Max foreign/global review pages")
+    p.add_argument("--max_foreign_reviews", type=int, default=200, help="Max foreign reviews")
     return p.parse_args()
 
 if __name__ == "__main__":
@@ -595,7 +878,11 @@ if __name__ == "__main__":
         args.query,
         max_products=args.max_products,
         executor_url=args.executor_url,
-        chrome_binary=args.chrome_binary
+        chrome_binary=args.chrome_binary,
+        max_review_pages=args.max_review_pages,
+        max_reviews=args.max_reviews,
+        max_foreign_pages=args.max_foreign_pages,
+        max_foreign_reviews=args.max_foreign_reviews
     )
     if not df.empty:
         save_results(df, args.query, Path(args.out_dir), args.out_csv)

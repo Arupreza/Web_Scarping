@@ -1,4 +1,7 @@
 /Products/
+test.ipynb
+
+
 # === Python caches ===
 __pycache__/
 *.pyc
