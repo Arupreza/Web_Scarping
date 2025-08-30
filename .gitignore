@@ -1,10 +1,4 @@
-# === Rust build artifacts ===
-/target/
-
-# Keep Cargo.lock (recommended for applications)
-# If you later turn this into a library, you can ignore it.
-# Cargo.lock
-
+/Products/
 # === Python caches ===
 __pycache__/
 *.pyc
