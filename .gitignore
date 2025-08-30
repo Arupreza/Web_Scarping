@@ -1,2 +1,37 @@
-/chrome-win64
-/.ipynb_checkpoints
+# === Rust build artifacts ===
+/target/
+
+# Keep Cargo.lock (recommended for applications)
+# If you later turn this into a library, you can ignore it.
+# Cargo.lock
+
+# === Python caches ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.venv/
+venv/
+.env
+
+# === Jupyter ===
+.ipynb_checkpoints/
+*.ipynb
+
+# === IDEs & Editors ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === OS clutter ===
+.DS_Store
+Thumbs.db
+
+# === Local tools/binaries ===
+/chrome-win64/
+
+# === Logs ===
+*.log
