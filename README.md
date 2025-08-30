@@ -1,17 +1,18 @@
-# 🛒 Selenium eBay Scraper
+# 🛒 Web Scraping Suite
 
-A robust Python-based **eBay product scraper** using **Selenium WebDriver** with remote Chrome driver support. Efficiently extracts comprehensive product information from eBay search results and product detail pages.
+A comprehensive Python-based **web scraping toolkit** featuring both **Amazon** and **eBay scrapers** using **Selenium WebDriver**. Efficiently extracts product information from major e-commerce platforms with remote Chrome driver support.
 
 ---
 
 ## ✨ Features
 
+- **Multi-platform support**: Amazon and eBay scrapers
 - **Remote Chrome WebDriver** integration (`chromedriver --port=9515`)
 - **Automatic consent popup handling** (GDPR/regional popups)
 - **Dual-layer data extraction**:
   - **Search Results Page**: Title, price, condition, shipping, ratings
   - **Product Detail Page**: Item ID, seller info, sold count, return policy
-- **CSV export** with timestamped filenames
+- **CSV export** with timestamped filenames to `Products/` directory
 - **Flexible CLI interface** with customizable parameters
 - **Error handling** and graceful failure recovery
 
@@ -25,6 +26,11 @@ A robust Python-based **eBay product scraper** using **Selenium WebDriver** with
 
 ### Install Dependencies
 
+```bash
+pip install -r requirements.txt
+```
+
+**Or install manually:**
 ```bash
 pip install selenium pandas
 ```
@@ -52,17 +58,25 @@ Launch ChromeDriver in a separate terminal:
 chromedriver --port=9515 --allowed-origins="*" --allowed-ips=""
 ```
 
-### 2. Run the Scraper
+### 2. Run the Scrapers
 
-Execute the scraper with your desired parameters:
+#### eBay Scraper
+Execute the eBay scraper with your desired parameters:
 
 ```bash
 python Selenium_eBay.py --query "wireless headphones" --max_products 3
 ```
 
+#### Amazon Scraper
+Execute the Amazon scraper:
+
+```bash
+python Selenium_Amazon.py --query "smartphone" --max_products 5
+```
+
 ### 3. Access Results
 
-Results are automatically saved to:
+Results are automatically saved to the `Products/` directory:
 ```
 Products/<sanitized_query>_<YYYYmmdd_HHMMSS>.csv
 ```
@@ -86,15 +100,25 @@ Products/<sanitized_query>_<YYYYmmdd_HHMMSS>.csv
 
 ### Example Commands
 
+#### eBay Scraper
 ```bash
 # Basic usage
 python Selenium_eBay.py --query "smartphone"
 
 # Advanced configuration
-python Selenium_eBay.py --query "gaming laptop" --max_products 10 --out_dir "results" --chrome_binary "/usr/bin/google-chrome"
+python Selenium_eBay.py --query "gaming laptop" --max_products 10 --out_dir "Products" --chrome_binary "/usr/bin/google-chrome"
 
 # Custom output file
 python Selenium_eBay.py --query "headphones" --out_csv "headphones_analysis.csv"
+```
+
+#### Amazon Scraper
+```bash
+# Basic usage
+python Selenium_Amazon.py --query "wireless mouse"
+
+# Specify maximum products
+python Selenium_Amazon.py --query "tablets" --max_products 8
 ```
 
 ---
@@ -162,13 +186,20 @@ chromedriver --version
 
 ### Code Structure
 ```
-Selenium_eBay.py          # Main scraper script
-├── WebDriver setup       # Remote Chrome configuration  
-├── Search execution      # Query processing
-├── Data extraction       # Product information parsing
-├── CSV export           # Results formatting
-└── Error handling       # Graceful failure management
+WEB_SCARPING/
+├── Products/                 # Output directory for CSV files
+├── .gitignore               # Git ignore rules
+├── README.md                # Project documentation
+├── requirements.txt         # Python dependencies
+├── Selenium_Amazon.py       # Amazon scraper script
+└── Selenium_eBay.py        # eBay scraper script
 ```
+
+Each scraper includes:
+- WebDriver setup and configuration
+- Search execution and query processing  
+- Data extraction and parsing
+- CSV export with error handling
 
 ### Contributing
 
